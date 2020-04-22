@@ -1,6 +1,7 @@
 package fluent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,13 +86,22 @@ type msgToSend struct {
 type Fluent struct {
 	Config
 
-	dialer      dialer
+	dialer dialer
+	// stopRunning is used in async mode to signal to run() and connectOrRetryAsync()
+	// they should abort.
 	stopRunning chan bool
-	pending     chan *msgToSend
-	wg          sync.WaitGroup
+	// stopAsyncConnect is used by connectOrRetryAsync() to signal to
+	// connectOrRetry() it should abort.
+	stopAsyncConnect chan bool
+	pending          chan *msgToSend
+	wg               sync.WaitGroup
 
 	muconn sync.Mutex
 	conn   net.Conn
+}
+
+type dialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // New creates a new Logger.
@@ -102,10 +112,6 @@ func New(config Config) (*Fluent, error) {
 	return newWithDialer(config, &net.Dialer{
 		Timeout: config.Timeout,
 	})
-}
-
-type dialer interface {
-	Dial(string, string) (net.Conn, error)
 }
 
 func newWithDialer(config Config, d dialer) (f *Fluent, err error) {
@@ -143,9 +149,11 @@ func newWithDialer(config Config, d dialer) (f *Fluent, err error) {
 
 	if config.Async {
 		f = &Fluent{
-			Config:  config,
-			dialer:  d,
-			pending: make(chan *msgToSend, config.BufferLimit),
+			Config:           config,
+			dialer:           d,
+			stopRunning:      make(chan bool),
+			stopAsyncConnect: make(chan bool),
+			pending:          make(chan *msgToSend, config.BufferLimit),
 		}
 		f.wg.Add(1)
 		go f.run()
@@ -154,7 +162,7 @@ func newWithDialer(config Config, d dialer) (f *Fluent, err error) {
 			Config: config,
 			dialer: d,
 		}
-		err = f.connect()
+		err = f.connect(context.Background())
 	}
 	return
 }
@@ -331,7 +339,11 @@ func (f *Fluent) Close() (err error) {
 		close(f.pending)
 		f.wg.Wait()
 	}
-	f.close(f.conn)
+
+	f.muconn.Lock()
+	f.close()
+	f.muconn.Unlock()
+
 	return
 }
 
@@ -346,35 +358,105 @@ func (f *Fluent) appendBuffer(msg *msgToSend) error {
 }
 
 // close closes the connection.
-func (f *Fluent) close(c net.Conn) {
-	f.muconn.Lock()
-	if f.conn != nil && f.conn == c {
+func (f *Fluent) close() {
+	if f.conn != nil {
 		f.conn.Close()
 		f.conn = nil
 	}
-	f.muconn.Unlock()
 }
 
 // connect establishes a new connection using the specified transport.
-func (f *Fluent) connect() (err error) {
+func (f *Fluent) connect(ctx context.Context) (err error) {
 	switch f.Config.FluentNetwork {
 	case "tcp":
-		f.conn, err = f.dialer.Dial(
+		f.conn, err = f.dialer.DialContext(ctx,
 			f.Config.FluentNetwork,
 			f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort))
 	case "unix":
-		f.conn, err = f.dialer.Dial(
+		f.conn, err = f.dialer.DialContext(ctx,
 			f.Config.FluentNetwork,
 			f.Config.FluentSocketPath)
 	default:
 		err = NewErrUnknownNetwork(f.Config.FluentNetwork)
 	}
+
 	return err
 }
 
+var errIsClosing = errors.New("fluent logger is closing, aborting async connect")
+
+func (f *Fluent) connectOrRetry(ctx context.Context) error {
+	// Use a Time channel instead of time.Sleep() to avoid blocking this
+	// goroutine during eventually way too much time (because of the exponential
+	// back-off retry).
+	waiter := time.After(time.Duration(0))
+	for i := 0; i < f.Config.MaxRetry; i++ {
+		select {
+		case <-waiter:
+			err := f.connect(ctx)
+			if err == nil {
+				return nil
+			}
+
+			if _, ok := err.(*ErrUnknownNetwork); ok {
+				// No need to retry on unknown network error. Thus false is passed
+				// to ready channel to let the other end drain the message queue.
+				return err
+			}
+
+			waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
+			if waitTime > f.Config.MaxRetryWait {
+				waitTime = f.Config.MaxRetryWait
+			}
+
+			waiter = time.After(time.Duration(waitTime) * time.Millisecond)
+		case <-f.stopAsyncConnect:
+			return errIsClosing
+		}
+	}
+
+	return fmt.Errorf("could not connect to fluentd after %d retries", f.Config.MaxRetry)
+}
+
+// connectOrRetryAsync returns an error when it fails to connect to fluentd or
+// when Close() has been called.
+func (f *Fluent) connectOrRetryAsync(ctx context.Context) error {
+	ctx, cancelDialing := context.WithCancel(ctx)
+	errCh := make(chan error)
+
+	f.wg.Add(1)
+	go func(ctx context.Context, errCh chan<- error) {
+		defer f.wg.Done()
+		errCh <- f.connectOrRetry(ctx)
+	}(ctx, errCh)
+
+	for {
+		select {
+		case _, ok := <-f.stopRunning:
+			// If f.stopRunning is closed before we got something on errCh,
+			// we need to wait a bit more.
+			if !ok {
+				break
+			}
+
+			// Stop any connection dialing and then tell connectOrRetry to stop
+			// trying to dial the connection. This has to be done in this
+			// specifc order to make sure connectOrRetry() is not blocking on
+			// the connection dialing.
+			cancelDialing()
+			f.stopAsyncConnect <- true
+		case err := <-errCh:
+			return err
+		}
+	}
+}
+
+// run is the goroutine used to unqueue and write logs in async mode. That
+// goroutine is meant to run during the whole life of the Fluent logger.
 func (f *Fluent) run() {
 	drainEvents := false
 	var emitEventDrainMsg sync.Once
+
 	for {
 		select {
 		case entry, ok := <-f.pending:
@@ -387,16 +469,16 @@ func (f *Fluent) run() {
 				continue
 			}
 			err := f.write(entry)
-			if err != nil {
+			if err == errIsClosing {
+				drainEvents = true
+			} else if err != nil {
+				// TODO: log failing message?
 				fmt.Fprintf(os.Stderr, "[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
 			}
-		}
-		select {
 		case stopRunning, ok := <-f.stopRunning:
 			if stopRunning || !ok {
 				drainEvents = true
 			}
-		default:
 		}
 	}
 }
@@ -406,61 +488,64 @@ func e(x, y float64) int {
 }
 
 func (f *Fluent) write(msg *msgToSend) error {
-	for i := 0; i < f.Config.MaxRetry; i++ {
-		c := f.conn
-		// Connect if needed
-		if c == nil {
-			f.muconn.Lock()
-			if f.conn == nil {
-				err := f.connect()
-				if err != nil {
-					f.muconn.Unlock()
+	// This function is used to ensure muconn is properly locked and unlocked
+	// between each retry. This gives the importunity to other goroutines to
+	// lock it (e.g. to close the connection).
+	writer := func() (bool, error) {
+		f.muconn.Lock()
+		defer f.muconn.Unlock()
 
-					if _, ok := err.(*ErrUnknownNetwork); ok {
-						// do not retry on unknown network error
-						break
-					}
-					waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
-					if waitTime > f.Config.MaxRetryWait {
-						waitTime = f.Config.MaxRetryWait
-					}
-					time.Sleep(time.Duration(waitTime) * time.Millisecond)
-					continue
-				}
+		if f.conn == nil {
+			var err error
+			if f.Config.Async {
+				err = f.connectOrRetryAsync(context.Background())
+			} else {
+				err = f.connectOrRetry(context.Background())
 			}
-			c = f.conn
-			f.muconn.Unlock()
+
+			if err != nil {
+				return false, err
+			}
 		}
 
-		// We're connected, write msg
 		t := f.Config.WriteTimeout
 		if time.Duration(0) < t {
-			c.SetWriteDeadline(time.Now().Add(t))
+			f.conn.SetWriteDeadline(time.Now().Add(t))
 		} else {
-			c.SetWriteDeadline(time.Time{})
+			f.conn.SetWriteDeadline(time.Time{})
 		}
-		_, err := c.Write(msg.data)
+
+		_, err := f.conn.Write(msg.data)
 		if err != nil {
-			f.close(c)
-		} else {
-			// Acknowledgment check
-			if msg.ack != "" {
-				resp := &AckResp{}
-				if f.Config.MarshalAsJSON {
-					dec := json.NewDecoder(c)
-					err = dec.Decode(resp)
-				} else {
-					r := msgp.NewReader(c)
-					err = resp.DecodeMsg(r)
-				}
-				if err != nil || resp.Ack != msg.ack {
-					f.close(c)
-					continue
-				}
+			f.close()
+			return true, err
+		}
+
+		// Acknowledgment check
+		if msg.ack != "" {
+			resp := &AckResp{}
+			if f.Config.MarshalAsJSON {
+				dec := json.NewDecoder(f.conn)
+				err = dec.Decode(resp)
+			} else {
+				r := msgp.NewReader(f.conn)
+				err = resp.DecodeMsg(r)
 			}
+
+			if err != nil || resp.Ack != msg.ack {
+				f.close()
+				return true, err
+			}
+		}
+
+		return false, nil
+	}
+
+	for i := 0; i < f.Config.MaxRetry; i++ {
+		if retry, err := writer(); !retry {
 			return err
 		}
 	}
 
-	return fmt.Errorf("fluent#write: failed to reconnect, max retry: %v", f.Config.MaxRetry)
+	return fmt.Errorf("fluent#write: failed to write after %d attempts", f.Config.MaxRetry)
 }

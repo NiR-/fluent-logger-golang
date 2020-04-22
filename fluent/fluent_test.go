@@ -2,6 +2,7 @@ package fluent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io/ioutil"
@@ -29,9 +30,14 @@ type testDialer struct {
 	connCh chan *Conn
 }
 
-func (d *testDialer) Dial(string, string) (net.Conn, error) {
-	conn := <-d.connCh
-	if conn == nil {
+func (d *testDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	select {
+	case conn := <-d.connCh:
+		if conn == nil {
+			return nil, errors.New("failed to dial")
+		}
+		return conn, nil
+	case <-ctx.Done():
 		return nil, errors.New("failed to dial")
 	}
 }
@@ -415,8 +421,6 @@ func timeout(t *testing.T, duration time.Duration, fn func(), reason string) {
 }
 
 func TestCloseOnFailingAsyncConnect(t *testing.T) {
-	t.Skip("Broken tests")
-
 	testcases := map[string]Config{
 		"with ForceStopAsyncSend and with RequestAck": {
 			Async:              true,
@@ -468,8 +472,6 @@ func ackRespMsgp(t *testing.T, ack string) string {
 }
 
 func TestCloseOnFailingAsyncReconnect(t *testing.T) {
-	t.Skip("Broken tests")
-
 	testcases := map[string]Config{
 		"with RequestAck": {
 			Async:              true,
