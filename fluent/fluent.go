@@ -38,6 +38,8 @@ const (
 	defaultSubSecondPrecision = false
 )
 
+var logId = rand.Intn(100)
+
 type Config struct {
 	FluentPort         int           `json:"fluent_port"`
 	FluentHost         string        `json:"fluent_host"`
@@ -349,6 +351,7 @@ func (f *Fluent) Close() (err error) {
 
 // appendBuffer appends data to buffer with lock.
 func (f *Fluent) appendBuffer(msg *msgToSend) error {
+	fmt.Fprintf(os.Stderr, "[%d] [appendBuffer] Append to f.pending...\n", logId)
 	select {
 	case f.pending <- msg:
 	default:
@@ -391,8 +394,10 @@ func (f *Fluent) connectOrRetry(ctx context.Context) error {
 	// back-off retry).
 	waiter := time.After(time.Duration(0))
 	for i := 0; i < f.Config.MaxRetry; i++ {
+		fmt.Fprintf(os.Stderr, "[%d] [connectOrRetry] Selecting on waiter and f.stopAsyncConnect...\n", logId)
 		select {
 		case <-waiter:
+			fmt.Fprintf(os.Stderr, "[%d] [connectOrRetry] Selected on waiter...\n", logId)
 			err := f.connect(ctx)
 			if err == nil {
 				return nil
@@ -411,6 +416,8 @@ func (f *Fluent) connectOrRetry(ctx context.Context) error {
 
 			waiter = time.After(time.Duration(waitTime) * time.Millisecond)
 		case <-f.stopAsyncConnect:
+			fmt.Fprintf(os.Stderr, "[%d] [connectOrRetry] Selected on f.stopAsyncConnect...\n", logId)
+
 			return errIsClosing
 		}
 	}
@@ -427,12 +434,17 @@ func (f *Fluent) connectOrRetryAsync(ctx context.Context) error {
 	f.wg.Add(1)
 	go func(ctx context.Context, errCh chan<- error) {
 		defer f.wg.Done()
+		defer fmt.Fprintf(os.Stderr, "[%d] [connectOrRetryAsync gofunc] Defered...\n", logId)
+		fmt.Fprintf(os.Stderr, "[%d] [connectOrRetryAsync gofunc] Calling connectorRetry...\n", logId)
 		errCh <- f.connectOrRetry(ctx)
+		fmt.Fprintf(os.Stderr, "[%d] [connectOrRetryAsync gofunc] Return...\n", logId)
 	}(ctx, errCh)
 
 	for {
+		fmt.Fprintf(os.Stderr, "[%d] [connectOrRetryAsync] Selecting on f.stopRunning and errCh...\n", logId)
 		select {
 		case _, ok := <-f.stopRunning:
+			fmt.Fprintf(os.Stderr, "[%d] [connectOrRetryAsync] Selected on f.stopRunning - ok: %t...\n", logId, ok)
 			// If f.stopRunning is closed before we got something on errCh,
 			// we need to wait a bit more.
 			if !ok {
@@ -446,6 +458,7 @@ func (f *Fluent) connectOrRetryAsync(ctx context.Context) error {
 			cancelDialing()
 			f.stopAsyncConnect <- true
 		case err := <-errCh:
+			fmt.Fprintf(os.Stderr, "[%d] [connectOrRetryAsync] Selected on errCh - err: %v...\n", logId, err)
 			return err
 		}
 	}
@@ -458,14 +471,18 @@ func (f *Fluent) run() {
 	var emitEventDrainMsg sync.Once
 
 	for {
+		fmt.Fprintf(os.Stderr, "[%d] [run] Selecting on f.pending...\n", logId)
 		select {
 		case entry, ok := <-f.pending:
+			fmt.Fprintf(os.Stderr, "[%d] [run] Selected on f.pending: %t - %v\n", logId, ok, entry)
+
 			if !ok {
 				f.wg.Done()
+				fmt.Fprintf(os.Stderr, "[%d] [run] Return after wg.Done()...\n", logId)
 				return
 			}
 			if drainEvents {
-				emitEventDrainMsg.Do(func() { fmt.Fprintf(os.Stderr, "[%s] Discarding queued events...\n", time.Now().Format(time.RFC3339)) })
+				emitEventDrainMsg.Do(func() { fmt.Fprintf(os.Stderr, "[%d] Discarding queued events...\n", logId) })
 				continue
 			}
 			err := f.write(entry)
@@ -473,9 +490,10 @@ func (f *Fluent) run() {
 				drainEvents = true
 			} else if err != nil {
 				// TODO: log failing message?
-				fmt.Fprintf(os.Stderr, "[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
+				fmt.Fprintf(os.Stderr, "[%d] Unable to send logs to fluentd, reconnecting...\n", logId)
 			}
 		case stopRunning, ok := <-f.stopRunning:
+			fmt.Fprintf(os.Stderr, "[%d] [run] Selected on f.stopRunning: %t - %t\n", logId, ok, stopRunning)
 			if stopRunning || !ok {
 				drainEvents = true
 			}
